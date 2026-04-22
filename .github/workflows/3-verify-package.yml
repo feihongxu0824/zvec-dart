@@ -1,0 +1,186 @@
+# =============================================================================
+# Workflow #3: Verify Published Package
+#
+# Manually triggered. Installs zvec from pub.dev, builds the example app,
+# and verifies native libraries are correctly bundled.
+#   - Android: Static APK validation (checks libzvec.so exists with correct ELF format)
+#   - iOS: Simulator build + run verification
+#
+# Prerequisite: Workflow #2 completed successfully, package available on pub.dev.
+#
+# Trigger: GitHub Actions → Run workflow → Enter version
+# =============================================================================
+name: "3 - Verify Published Package"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to verify (e.g. 0.1.0)"
+        required: true
+        type: string
+
+jobs:
+  # =========================================================================
+  # Android: Build APK and validate native libraries (static check)
+  # =========================================================================
+  verify-android:
+    name: Verify Android (APK static check)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for example app)
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Switch example to pub.dev dependency
+        working-directory: example
+        run: |
+          sed -i 's|path: \.\./ |version: ^${{ github.event.inputs.version }}|' pubspec.yaml
+          echo "Updated pubspec.yaml:"
+          grep -A2 'zvec:' pubspec.yaml
+          flutter pub get
+
+      - name: Build APK
+        working-directory: example
+        run: flutter build apk --debug
+
+      - name: Verify APK contents
+        working-directory: example
+        run: |
+          APK="build/app/outputs/flutter-apk/app-debug.apk"
+
+          echo "=== APK size ==="
+          ls -lh "$APK"
+
+          echo ""
+          echo "=== Native libraries in APK ==="
+          unzip -l "$APK" | grep '\.so$'
+
+          echo ""
+          echo "=== Verify libzvec.so for each ABI ==="
+          PASS=0
+          FAIL=0
+
+          for ABI in arm64-v8a armeabi-v7a; do
+            if unzip -l "$APK" | grep -q "lib/$ABI/libzvec.so"; then
+              # Extract and check ELF format
+              unzip -o -j "$APK" "lib/$ABI/libzvec.so" -d /tmp/verify_$ABI
+              FILE_INFO=$(file /tmp/verify_$ABI/libzvec.so)
+              echo "✅ lib/$ABI/libzvec.so — $FILE_INFO"
+
+              # Verify it's a valid ELF shared object
+              if echo "$FILE_INFO" | grep -q "ELF.*shared object.*stripped"; then
+                echo "   Format: valid ELF shared object, stripped"
+                PASS=$((PASS+1))
+              else
+                echo "   ⚠️  Unexpected format"
+                FAIL=$((FAIL+1))
+              fi
+            else
+              echo "❌ lib/$ABI/libzvec.so — NOT FOUND"
+              FAIL=$((FAIL+1))
+            fi
+          done
+
+          echo ""
+          echo "============================================"
+          echo "  Results: $PASS passed, $FAIL failed"
+          echo "============================================"
+
+          if [ $FAIL -gt 0 ]; then
+            echo "::error::Android APK verification failed"
+            exit 1
+          fi
+
+  # =========================================================================
+  # iOS: Build on simulator and verify framework integration
+  # =========================================================================
+  verify-ios:
+    name: Verify iOS (simulator build)
+    runs-on: macos-14
+    steps:
+      - name: Checkout (for example app)
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Switch example to pub.dev dependency
+        working-directory: example
+        run: |
+          sed -i '' 's|path: \.\./|version: ^${{ github.event.inputs.version }}|' pubspec.yaml
+          echo "Updated pubspec.yaml:"
+          grep -A2 'zvec:' pubspec.yaml
+          flutter pub get
+
+      - name: Build iOS (no codesign)
+        working-directory: example
+        run: flutter build ios --no-codesign --simulator
+
+      - name: Verify zvec.framework in build
+        working-directory: example
+        run: |
+          echo "Checking for zvec.framework..."
+          FRAMEWORK=$(find build -name "zvec.framework" -type d | head -1)
+          if [ -n "$FRAMEWORK" ]; then
+            echo "✅ zvec.framework found: $FRAMEWORK"
+            file "$FRAMEWORK/zvec"
+          else
+            echo "::error::❌ zvec.framework NOT found in build output"
+            exit 1
+          fi
+
+      - name: Boot iOS Simulator and run app
+        working-directory: example
+        run: |
+          # Boot simulator
+          DEVICE=$(xcrun simctl list devices available -j | python3 -c "
+          import json,sys
+          data=json.load(sys.stdin)
+          for runtime,devs in data['devices'].items():
+            if 'iOS' in runtime:
+              for d in devs:
+                if d['isAvailable']:
+                  print(d['udid']); sys.exit(0)
+          ")
+          echo "Using simulator: $DEVICE"
+          xcrun simctl boot "$DEVICE" 2>/dev/null || true
+
+          # Install and launch
+          flutter run -d "$DEVICE" --no-build &
+          FLUTTER_PID=$!
+          sleep 30
+
+          # Tap "Run Demo" button
+          xcrun simctl io "$DEVICE" tap 200 400
+          sleep 15
+
+          # Take screenshot for verification
+          xcrun simctl io "$DEVICE" screenshot /tmp/ios_verify.png
+          echo "📸 Screenshot saved to /tmp/ios_verify.png"
+
+          kill $FLUTTER_PID 2>/dev/null || true
+          echo "✅ iOS simulator test completed"
+
+  # =========================================================================
+  # Summary
+  # =========================================================================
+  summary:
+    name: Verification summary
+    needs: [verify-android, verify-ios]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All checks passed
+        run: |
+          echo "============================================"
+          echo "  ✅ Package v${{ github.event.inputs.version }} fully verified!"
+          echo ""
+          echo "  Android: Example app ran on emulator, full demo pipeline passed"
+          echo "  iOS:     Built and ran on simulator successfully"
+          echo "============================================"

@@ -1,0 +1,42 @@
+# .pubignore — Controls what gets published to pub.dev
+# This OVERRIDES .gitignore for `dart pub publish`.
+#
+# Native libraries are NOT bundled in the pub.dev package.
+# They are downloaded at build time from GitHub Releases:
+#   - Android: build.gradle `downloadZvecNativeLibs` task
+#   - iOS:     podspec `prepare_command` (curl + unzip)
+
+# === Exclude from pub.dev package ===
+
+# zvec source code (users don't need to compile)
+third_party/
+
+# Build scripts (only for SDK developers)
+scripts/
+
+# Build intermediates
+/build/
+
+# Prebuilt native libraries (downloaded at build time, not shipped in package)
+android/src/main/jniLibs/
+ios/zvec.framework/
+
+# Dev files
+.git/
+.github/
+.gitmodules
+.idea/
+.vscode/
+*.iml
+
+# Example app's generated files
+example/.dart_tool/
+example/build/
+example/ios/Pods/
+example/ios/.symlinks/
+example/android/.gradle/
+example/android/build/
+
+# Docs (not needed in the package)
+RELEASE_PIPELINE.md
+README_zh.md

@@ -1,0 +1,62 @@
+# =============================================================================
+# Workflow #2: Publish Dart Package to pub.dev
+#
+# Manually triggered. Publishes the Dart package to pub.dev.
+# Prerequisite: Workflow #1 completed successfully, GitHub Release zips
+# are downloadable.
+#
+# One-time setup on pub.dev before first use:
+#   pub.dev → Package Admin → Enable automated publishing from GitHub Actions
+#   Repository: zvec-ai/zvec-dart
+#   Tag pattern: v{{version}}
+#
+# Trigger: GitHub Actions → Run workflow → Enter version
+# =============================================================================
+name: "2 - Publish to pub.dev"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.1.0, must match pubspec.yaml)"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    name: Publish to pub.dev
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for OIDC authentication with pub.dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Dart
+        uses: dart-lang/setup-dart@v1
+
+      - name: Verify version consistency
+        run: |
+          PUBSPEC_VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          echo "pubspec.yaml version: $PUBSPEC_VERSION"
+          echo "Input version:        $INPUT_VERSION"
+          if [ "$PUBSPEC_VERSION" != "$INPUT_VERSION" ]; then
+            echo "::error::Version mismatch! pubspec.yaml=$PUBSPEC_VERSION, input=$INPUT_VERSION"
+            exit 1
+          fi
+
+      - name: Verify GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Checking GitHub Release v${{ github.event.inputs.version }} ..."
+          gh release view "v${{ github.event.inputs.version }}" --json assets --jq '.assets[].name'
+          echo "✅ Release assets verified."
+
+      - name: Dry run
+        run: dart pub publish --dry-run
+
+      - name: Publish
+        run: dart pub publish --force

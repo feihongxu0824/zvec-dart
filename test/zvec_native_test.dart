@@ -1,0 +1,1083 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// FFI-dependent unit tests for the Zvec Dart SDK.
+///
+/// These tests require the native library (libzvec.dylib on macOS).
+/// Run with:
+///   bash scripts/run_tests.sh test/zvec_native_test.dart
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:zvec/zvec.dart';
+
+/// Create a fresh temp directory for test isolation.
+Directory _createTempDir(String prefix) {
+  return Directory.systemTemp.createTempSync('zvec_test_$prefix');
+}
+
+/// Return a sub-path inside [dir] that does NOT yet exist.
+/// Collection.createAndOpen requires the target path to be absent.
+String _dbPath(Directory dir) => '${dir.path}/db';
+
+/// Clean up a temp directory.
+void _cleanupDir(Directory dir) {
+  if (dir.existsSync()) {
+    dir.deleteSync(recursive: true);
+  }
+}
+
+/// Helper: create a minimal schema with a 4-dim FP32 vector and a string field.
+CollectionSchema _createTestSchema() {
+  return CollectionSchema(name: 'test_collection', fields: [
+    VectorSchema('embedding', 4, indexParams: HnswIndexParams()),
+    FieldSchema(name: 'title', dataType: DataType.string),
+    FieldSchema(name: 'count', dataType: DataType.int64),
+    FieldSchema(name: 'score_val', dataType: DataType.float64),
+    FieldSchema(name: 'active', dataType: DataType.bool_),
+  ]);
+}
+
+/// Helper: create a populated collection with test data and return it.
+/// Caller is responsible for closing and cleaning up.
+(Collection, Directory) _createPopulatedCollection() {
+  final dir = _createTempDir('populated');
+  final schema = _createTestSchema();
+  final collection = Collection.createAndOpen(_dbPath(dir), schema);
+  schema.destroy();
+
+  // Insert 10 documents
+  final rng = Random(42);
+  final docs = <Doc>[];
+  for (var i = 0; i < 10; i++) {
+    final vec = Float32List.fromList(
+      List.generate(4, (_) => rng.nextDouble()),
+    );
+    final doc = Doc(id: 'pk_$i')
+      ..setField('title', 'Document #$i')
+      ..setField('count', i * 10)
+      ..setField('score_val', i * 1.5)
+      ..setField('active', i % 2 == 0)
+      ..setVector('embedding', vec);
+    docs.add(doc);
+  }
+  collection.insert(docs);
+  for (final doc in docs) {
+    doc.destroy();
+  }
+
+  collection.optimize();
+  return (collection, dir);
+}
+
+void main() {
+  // Single initialization for the whole test suite.
+  // Zvec.shutdown() / re-initialize cycles can block, so we initialize once.
+  setUpAll(() => Zvec.initialize());
+  tearDownAll(() => Zvec.shutdown());
+
+  // =========================================================================
+  // Task 4: Zvec lifecycle and config
+  // =========================================================================
+  group('Zvec lifecycle', () {
+    test('isInitialized is true after initialize', () {
+      expect(Zvec.isInitialized, isTrue);
+    });
+
+    test('version is non-empty string', () {
+      expect(Zvec.version, isNotEmpty);
+      expect(Zvec.versionMajor, greaterThanOrEqualTo(0));
+      expect(Zvec.versionMinor, greaterThanOrEqualTo(0));
+      expect(Zvec.versionPatch, greaterThanOrEqualTo(0));
+    });
+
+    test('checkVersion with current version returns true', () {
+      final major = Zvec.versionMajor;
+      final minor = Zvec.versionMinor;
+      final patch = Zvec.versionPatch;
+      expect(Zvec.checkVersion(major, minor, patch), isTrue);
+    });
+  });
+
+  group('ConfigData', () {
+    test('create and set properties', () {
+      final config = ConfigData();
+
+      config.setMemoryLimit(1024 * 1024 * 512); // 512 MB
+      expect(config.memoryLimit, 1024 * 1024 * 512);
+
+      config.setQueryThreadCount(4);
+      expect(config.queryThreadCount, 4);
+
+      config.setOptimizeThreadCount(2);
+      expect(config.optimizeThreadCount, 2);
+
+      config.destroy();
+    });
+
+    test('destroy sets internal state to null', () {
+      final config = ConfigData();
+      config.destroy();
+      // Accessing after destroy should throw StateError
+      expect(() => config.memoryLimit, throwsStateError);
+    });
+  });
+
+  group('LogConfig', () {
+    test('console log config creation', () {
+      final log = LogConfig.console(level: LogLevel.debug);
+      expect(log.nativePtr, isNotNull);
+      log.destroy();
+    });
+
+    test('file log config creation', () {
+      final tmpDir = _createTempDir('logconfig');
+      try {
+        final log = LogConfig.file(
+          level: LogLevel.warn,
+          directory: tmpDir.path,
+          basename: 'test_log',
+          fileSizeMb: 50,
+          overdueDays: 3,
+        );
+        expect(log.nativePtr, isNotNull);
+        log.destroy();
+      } finally {
+        _cleanupDir(tmpDir);
+      }
+    });
+  });
+
+  group('ConfigData with LogConfig', () {
+    test('custom config can be created and configured', () {
+      final config = ConfigData();
+      config.setQueryThreadCount(2);
+      final log = LogConfig.console(level: LogLevel.warn);
+      config.setLogConfig(log);
+      // LogConfig ownership transferred — do NOT destroy log
+
+      // Verify config was built without error
+      expect(config.queryThreadCount, 2);
+      config.destroy();
+    });
+  });
+
+  // =========================================================================
+  // Task 5: Schema and field tests
+  // =========================================================================
+  group('FieldSchema', () {
+
+    test('scalar field properties', () {
+      final field = FieldSchema(
+        name: 'title',
+        dataType: DataType.string,
+        nullable: true,
+      );
+      expect(field.name, 'title');
+      expect(field.dataType, DataType.string);
+      expect(field.isNullable, isTrue);
+      expect(field.dimension, 0);
+      expect(field.isVectorField, isFalse);
+      expect(field.isDenseVector, isFalse);
+      expect(field.isSparseVector, isFalse);
+      expect(field.hasIndex, isFalse);
+      field.destroy();
+    });
+
+    test('vector field properties', () {
+      final field = FieldSchema(
+        name: 'vec',
+        dataType: DataType.vectorFp32,
+        nullable: false,
+        dimension: 128,
+      );
+      expect(field.name, 'vec');
+      expect(field.dataType, DataType.vectorFp32);
+      expect(field.isNullable, isFalse);
+      expect(field.dimension, 128);
+      expect(field.isVectorField, isTrue);
+      expect(field.isDenseVector, isTrue);
+      expect(field.isSparseVector, isFalse);
+      field.destroy();
+    });
+
+    test('setIndexParams attaches index', () {
+      final field = FieldSchema(
+        name: 'vec',
+        dataType: DataType.vectorFp32,
+        dimension: 64,
+      );
+      expect(field.hasIndex, isFalse);
+
+      final params = HnswIndexParams(m: 32, efConstruction: 100);
+      field.setIndexParams(params);
+      expect(field.hasIndex, isTrue);
+      expect(field.indexType, IndexType.hnsw);
+
+      params.destroy();
+      field.destroy();
+    });
+  });
+
+  group('VectorSchema', () {
+
+    test('creates vector field with correct defaults', () {
+      final vs = VectorSchema('embed', 256);
+      expect(vs.name, 'embed');
+      expect(vs.dataType, DataType.vectorFp32);
+      expect(vs.dimension, 256);
+      expect(vs.isNullable, isFalse);
+      expect(vs.isVectorField, isTrue);
+      vs.destroy();
+    });
+
+    test('auto-sets index params', () {
+      final vs = VectorSchema('embed', 128, indexParams: HnswIndexParams());
+      expect(vs.hasIndex, isTrue);
+      expect(vs.indexType, IndexType.hnsw);
+      vs.destroy();
+    });
+  });
+
+  group('CollectionSchema', () {
+
+    test('create with name and fields', () {
+      final schema = CollectionSchema(name: 'my_coll', fields: [
+        FieldSchema(name: 'f1', dataType: DataType.string),
+      ]);
+      expect(schema.name, 'my_coll');
+      expect(schema.hasField('f1'), isTrue);
+      expect(schema.hasField('nonexistent'), isFalse);
+      schema.destroy();
+    });
+
+    test('name getter/setter', () {
+      final schema = CollectionSchema(name: 'old_name');
+      expect(schema.name, 'old_name');
+      schema.name = 'new_name';
+      expect(schema.name, 'new_name');
+      schema.destroy();
+    });
+
+    test('addField and getField', () {
+      final schema = CollectionSchema(name: 'test');
+      final field = FieldSchema(name: 'age', dataType: DataType.int64);
+      schema.addField(field);
+      field.destroy();
+
+      expect(schema.hasField('age'), isTrue);
+      final retrieved = schema.getField('age');
+      expect(retrieved, isNotNull);
+      expect(retrieved!.name, 'age');
+      expect(retrieved.dataType, DataType.int64);
+      // Non-owning pointer — do not destroy retrieved
+      schema.destroy();
+    });
+
+    test('getField returns null for unknown field', () {
+      final schema = CollectionSchema(name: 'test');
+      expect(schema.getField('unknown'), isNull);
+      schema.destroy();
+    });
+
+    test('dropField removes field', () {
+      final schema = CollectionSchema(name: 'test', fields: [
+        FieldSchema(name: 'f1', dataType: DataType.string),
+        FieldSchema(name: 'f2', dataType: DataType.int64),
+      ]);
+      expect(schema.hasField('f1'), isTrue);
+      schema.dropField('f1');
+      expect(schema.hasField('f1'), isFalse);
+      expect(schema.hasField('f2'), isTrue);
+      schema.destroy();
+    });
+
+    test('addIndex and dropIndex on field', () {
+      // Use a scalar field to test addIndex / dropIndex clearly
+      final schema = CollectionSchema(name: 'test', fields: [
+        FieldSchema(name: 'title', dataType: DataType.string),
+      ]);
+      final field = schema.getField('title');
+      expect(field, isNotNull);
+      expect(field!.hasIndex, isFalse);
+
+      final params = InvertIndexParams();
+      schema.addIndex('title', params);
+      params.destroy();
+
+      final fieldAfter = schema.getField('title');
+      expect(fieldAfter!.hasIndex, isTrue);
+
+      schema.dropIndex('title');
+      final fieldAfterDrop = schema.getField('title');
+      expect(fieldAfterDrop!.hasIndex, isFalse);
+      schema.destroy();
+    });
+
+    test('validate passes for valid schema', () {
+      final schema = _createTestSchema();
+      expect(() => schema.validate(), returnsNormally);
+      schema.destroy();
+    });
+  });
+
+  // =========================================================================
+  // Task 6: Collection lifecycle and options
+  // =========================================================================
+  group('CollectionOptions', () {
+
+    test('default options', () {
+      final opts = CollectionOptions();
+      // Just verify getters don't throw
+      opts.enableMmap;
+      opts.maxBufferSize;
+      opts.readOnly;
+      opts.destroy();
+    });
+
+    test('set and get properties', () {
+      final opts = CollectionOptions();
+      opts.enableMmap = true;
+      expect(opts.enableMmap, isTrue);
+      opts.enableMmap = false;
+      expect(opts.enableMmap, isFalse);
+
+      opts.readOnly = true;
+      expect(opts.readOnly, isTrue);
+      opts.destroy();
+    });
+
+    test('destroy sets internal state to null', () {
+      final opts = CollectionOptions();
+      opts.destroy();
+      expect(() => opts.enableMmap, throwsStateError);
+    });
+  });
+
+  group('Collection lifecycle', () {
+
+    test('createAndOpen then close', () {
+      final dir = _createTempDir('lifecycle');
+      try {
+        final schema = _createTestSchema();
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('open existing collection', () {
+      final dir = _createTempDir('reopen');
+      try {
+        // Create
+        final schema = _createTestSchema();
+        final c1 = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+        c1.close();
+
+        // Re-open
+        final c2 = Collection.open(_dbPath(dir));
+        c2.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('flush does not throw', () {
+      final dir = _createTempDir('flush');
+      try {
+        final schema = _createTestSchema();
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+        expect(() => collection.flush(), returnsNormally);
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('optimize does not throw', () {
+      final dir = _createTempDir('optimize');
+      try {
+        final schema = _createTestSchema();
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+        expect(() => collection.optimize(), returnsNormally);
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('schema/options/stats accessors', () {
+      final dir = _createTempDir('accessors');
+      try {
+        final schema = _createTestSchema();
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+
+        final s = collection.schema;
+        expect(s.name, 'test_collection');
+        s.destroy();
+
+        final o = collection.options;
+        o.destroy();
+
+        final st = collection.stats;
+        expect(st.docCount, 0);
+        st.destroy();
+
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+  });
+
+  // =========================================================================
+  // Task 7: Doc operations
+  // =========================================================================
+  group('Doc', () {
+
+    test('default constructor creates empty doc', () {
+      final doc = Doc();
+      expect(doc.isEmpty, isTrue);
+      expect(doc.fieldCount, 0);
+      doc.destroy();
+    });
+
+    test('constructor with id', () {
+      final doc = Doc(id: 'my_pk');
+      expect(doc.pk, 'my_pk');
+      doc.destroy();
+    });
+
+    test('pk getter/setter', () {
+      final doc = Doc();
+      // A fresh Doc without id may return null or empty string depending on native impl
+      expect(doc.pk, anyOf(isNull, isEmpty));
+      doc.pk = 'test_pk';
+      expect(doc.pk, 'test_pk');
+      doc.destroy();
+    });
+
+    test('constructor with fields map', () {
+      final doc = Doc(id: 'pk1', fields: {
+        'name': 'Alice',
+        'age': 30,
+        'height': 1.65,
+        'active': true,
+        'vec': Float32List.fromList([1.0, 2.0, 3.0]),
+      });
+      expect(doc.pk, 'pk1');
+      expect(doc.getString('name'), 'Alice');
+      expect(doc.getInt64('age'), 30);
+      expect(doc.getDouble('height'), closeTo(1.65, 0.001));
+      expect(doc.getBool('active'), isTrue);
+      expect(doc.getVector('vec'), isNotNull);
+      expect(doc.getVector('vec')!.length, 3);
+      doc.destroy();
+    });
+
+    test('setField and getters for all scalar types', () {
+      final doc = Doc();
+      doc.setField('s', 'hello');
+      doc.setField('i', 42);
+      doc.setField('d', 3.14);
+      doc.setField('b', false);
+
+      expect(doc.getString('s'), 'hello');
+      expect(doc.getInt64('i'), 42);
+      expect(doc.getDouble('d'), closeTo(3.14, 0.001));
+      expect(doc.getBool('b'), isFalse);
+      doc.destroy();
+    });
+
+    test('setField throws for unsupported type', () {
+      final doc = Doc();
+      expect(() => doc.setField('x', [1, 2, 3]), throwsArgumentError);
+      doc.destroy();
+    });
+
+    test('setVector and getVector round-trip', () {
+      final doc = Doc();
+      final vec = Float32List.fromList([0.1, 0.2, 0.3, 0.4]);
+      doc.setVector('v', vec);
+      final result = doc.getVector('v');
+      expect(result, isNotNull);
+      expect(result!.length, 4);
+      for (var i = 0; i < 4; i++) {
+        expect(result[i], closeTo(vec[i], 1e-6));
+      }
+      doc.destroy();
+    });
+
+    test('setVector64 for FP64 vectors', () {
+      final doc = Doc();
+      final vec = Float64List.fromList([1.1, 2.2, 3.3]);
+      doc.setVector64('v64', vec);
+      expect(doc.hasField('v64'), isTrue);
+      doc.destroy();
+    });
+
+    test('hasField and fieldCount', () {
+      final doc = Doc();
+      expect(doc.hasField('x'), isFalse);
+      doc.setField('x', 'val');
+      expect(doc.hasField('x'), isTrue);
+      expect(doc.fieldCount, greaterThan(0));
+      doc.destroy();
+    });
+
+    test('setFieldNull and isFieldNull', () {
+      final doc = Doc();
+      doc.setField('s', 'hello');
+      expect(doc.isFieldNull('s'), isFalse);
+      doc.setFieldNull('s');
+      expect(doc.isFieldNull('s'), isTrue);
+      // Getter should return null for null field
+      expect(doc.getString('s'), isNull);
+      doc.destroy();
+    });
+
+    test('fieldNames returns list of field names', () {
+      final doc = Doc();
+      doc.setField('alpha', 'a');
+      doc.setField('beta', 42);
+      final names = doc.fieldNames;
+      expect(names, containsAll(['alpha', 'beta']));
+      doc.destroy();
+    });
+
+    test('getters return null for non-existent fields', () {
+      final doc = Doc();
+      expect(doc.getString('nope'), isNull);
+      expect(doc.getInt64('nope'), isNull);
+      expect(doc.getDouble('nope'), isNull);
+      expect(doc.getBool('nope'), isNull);
+      expect(doc.getVector('nope'), isNull);
+      doc.destroy();
+    });
+
+    test('toString format', () {
+      final doc = Doc(id: 'pk1');
+      doc.setField('a', 'b');
+      final s = doc.toString();
+      expect(s, contains('pk=pk1'));
+      expect(s, contains('Doc('));
+      doc.destroy();
+    });
+  });
+
+  // =========================================================================
+  // Task 8: DML operations (insert/update/upsert/delete)
+  // =========================================================================
+  group('Collection DML', () {
+
+    test('insert returns correct WriteResult', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        // Already inserted 10 docs in helper
+        final fetched = collection.fetch(['pk_0', 'pk_9']);
+        expect(fetched.length, 2);
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('update modifies existing documents', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        final doc = Doc(id: 'pk_0')
+          ..setField('title', 'Updated Title');
+        final result = collection.update([doc]);
+        doc.destroy();
+        expect(result.successCount, 1);
+
+        final fetched = collection.fetch(['pk_0']);
+        expect(fetched.length, 1);
+        expect(fetched[0].getString('title'), 'Updated Title');
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('upsert inserts new and updates existing', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        // Upsert: update existing pk_0 + insert new pk_new
+        final vec = Float32List.fromList([0.5, 0.5, 0.5, 0.5]);
+        final docs = [
+          Doc(id: 'pk_0')
+            ..setField('title', 'Upserted')
+            ..setVector('embedding', vec),
+          Doc(id: 'pk_new')
+            ..setField('title', 'Brand New')
+            ..setVector('embedding', vec),
+        ];
+        final result = collection.upsert(docs);
+        for (final d in docs) {
+          d.destroy();
+        }
+        expect(result.successCount, 2);
+        expect(result.isAllSuccess, isTrue);
+
+        final fetched = collection.fetch(['pk_0', 'pk_new']);
+        expect(fetched.length, 2);
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('delete by primary keys', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        final result = collection.delete(['pk_0', 'pk_1']);
+        expect(result.successCount, 2);
+        expect(result.isAllSuccess, isTrue);
+
+        final fetched = collection.fetch(['pk_0', 'pk_1']);
+        expect(fetched.length, 0);
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('deleteByFilter removes matching docs', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        // Delete docs where count >= 50 (pk_5..pk_9 → 5 docs)
+        collection.deleteByFilter('count >= 50');
+        collection.optimize();
+
+        final stats = collection.stats;
+        expect(stats.docCount, 5);
+        stats.destroy();
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('WriteResult end-to-end', () {
+      final dir = _createTempDir('writeresult');
+      try {
+        final schema = _createTestSchema();
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+
+        final vec = Float32List.fromList([1.0, 2.0, 3.0, 4.0]);
+        final docs = [
+          Doc(id: 'a')
+            ..setField('title', 'A')
+            ..setVector('embedding', vec),
+          Doc(id: 'b')
+            ..setField('title', 'B')
+            ..setVector('embedding', vec),
+        ];
+        final result = collection.insert(docs);
+        for (final d in docs) {
+          d.destroy();
+        }
+
+        expect(result.successCount, 2);
+        expect(result.errorCount, 0);
+        expect(result.totalCount, 2);
+        expect(result.isAllSuccess, isTrue);
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+  });
+
+  // =========================================================================
+  // Task 9: Query and fetch tests
+  // =========================================================================
+  group('VectorQuery', () {
+    late Collection collection;
+    late Directory tmpDir;
+
+    setUpAll(() {
+      final result = _createPopulatedCollection();
+      collection = result.$1;
+      tmpDir = result.$2;
+    });
+
+    tearDownAll(() {
+      try { collection.close(); } catch (_) {}
+      _cleanupDir(tmpDir);
+    });
+
+    test('basic vector search returns results', () {
+      final query = VectorQuery(
+        fieldName: 'embedding',
+        vector: Float32List.fromList([0.5, 0.5, 0.5, 0.5]),
+        topk: 5,
+      );
+      final results = collection.query(query);
+      query.destroy();
+
+      expect(results, isNotEmpty);
+      expect(results.length, lessThanOrEqualTo(5));
+      // Results should have pk and score
+      for (final doc in results) {
+        expect(doc.pk, isNotNull);
+        expect(doc.score, isNotNull);
+      }
+    });
+
+    test('query with outputFields', () {
+      final query = VectorQuery(
+        fieldName: 'embedding',
+        vector: Float32List.fromList([0.1, 0.2, 0.3, 0.4]),
+        topk: 3,
+        outputFields: ['title'],
+      );
+      final results = collection.query(query);
+      query.destroy();
+
+      expect(results, isNotEmpty);
+      for (final doc in results) {
+        expect(doc.getString('title'), isNotNull);
+      }
+    });
+
+    test('query with filter', () {
+      final query = VectorQuery(
+        fieldName: 'embedding',
+        vector: Float32List.fromList([0.5, 0.5, 0.5, 0.5]),
+        topk: 10,
+        filter: 'count >= 50',
+        outputFields: ['count'],
+      );
+      final results = collection.query(query);
+      query.destroy();
+
+      // All results should have count >= 50
+      for (final doc in results) {
+        expect(doc.getInt64('count'), greaterThanOrEqualTo(50));
+      }
+    });
+
+    test('query with includeVector returns vector data', () {
+      final query = VectorQuery(
+        fieldName: 'embedding',
+        vector: Float32List.fromList([0.1, 0.2, 0.3, 0.4]),
+        topk: 2,
+        includeVector: true,
+      );
+      final results = collection.query(query);
+      query.destroy();
+
+      expect(results, isNotEmpty);
+      for (final doc in results) {
+        final vec = doc.getVector('embedding');
+        expect(vec, isNotNull);
+        expect(vec!.length, 4);
+      }
+    });
+
+    test('query with HnswQueryParams', () {
+      final qp = HnswQueryParams(ef: 100);
+      final query = VectorQuery(
+        fieldName: 'embedding',
+        vector: Float32List.fromList([0.5, 0.5, 0.5, 0.5]),
+        topk: 3,
+        queryParams: qp,
+      );
+      final results = collection.query(query);
+      query.destroy();
+      expect(results, isNotEmpty);
+    });
+  });
+
+  group('Collection.fetch', () {
+    late Collection collection;
+    late Directory tmpDir;
+
+    setUpAll(() {
+      final result = _createPopulatedCollection();
+      collection = result.$1;
+      tmpDir = result.$2;
+    });
+
+    tearDownAll(() {
+      try { collection.close(); } catch (_) {}
+      _cleanupDir(tmpDir);
+    });
+
+    test('fetch existing PKs returns documents', () {
+      final docs = collection.fetch(['pk_0', 'pk_5']);
+      expect(docs.length, 2);
+    });
+
+    test('fetch non-existing PK returns empty', () {
+      final docs = collection.fetch(['nonexistent_pk']);
+      expect(docs, isEmpty);
+    });
+
+    test('fetch mixed existing and non-existing', () {
+      final docs = collection.fetch(['pk_0', 'not_here', 'pk_9']);
+      expect(docs.length, 2);
+    });
+  });
+
+  // =========================================================================
+  // Task 10: Index params, query params, column management
+  // =========================================================================
+  group('IndexParams', () {
+
+    test('HnswIndexParams defaults', () {
+      final p = HnswIndexParams();
+      expect(p.indexType, IndexType.hnsw);
+      expect(p.metricType, MetricType.cosine);
+      expect(p.m, 16);
+      expect(p.efConstruction, 200);
+      p.destroy();
+    });
+
+    test('HnswIndexParams custom values', () {
+      final p = HnswIndexParams(
+        m: 32,
+        efConstruction: 400,
+        metricType: MetricType.l2,
+        quantizeType: QuantizeType.fp16,
+      );
+      expect(p.m, 32);
+      expect(p.efConstruction, 400);
+      expect(p.metricType, MetricType.l2);
+      expect(p.quantizeType, QuantizeType.fp16);
+      p.destroy();
+    });
+
+    test('IVFIndexParams', () {
+      final p = IVFIndexParams(
+        nList: 50,
+        metricType: MetricType.ip,
+      );
+      expect(p.indexType, IndexType.ivf);
+      expect(p.metricType, MetricType.ip);
+      p.destroy();
+    });
+
+    test('FlatIndexParams', () {
+      final p = FlatIndexParams(metricType: MetricType.l2);
+      expect(p.indexType, IndexType.flat);
+      expect(p.metricType, MetricType.l2);
+      p.destroy();
+    });
+
+    test('InvertIndexParams', () {
+      final p = InvertIndexParams();
+      expect(p.indexType, IndexType.invert);
+      p.destroy();
+    });
+  });
+
+  group('QueryParams', () {
+
+    test('HnswQueryParams default and custom ef', () {
+      final p = HnswQueryParams();
+      expect(p.ef, 40);
+
+      final p2 = HnswQueryParams(ef: 200);
+      expect(p2.ef, 200);
+      p2.ef = 300;
+      expect(p2.ef, 300);
+
+      p.destroy();
+      p2.destroy();
+    });
+
+    test('IVFQueryParams', () {
+      final p = IVFQueryParams(nprobe: 20);
+      expect(p.nprobe, 20);
+      p.nprobe = 30;
+      expect(p.nprobe, 30);
+      p.destroy();
+    });
+
+    test('FlatQueryParams', () {
+      final p = FlatQueryParams();
+      expect(p.nativePtr, isNotNull);
+      p.destroy();
+    });
+  });
+
+  group('Collection DDL (column management)', () {
+
+    test('addColumn adds a new field', () {
+      final dir = _createTempDir('ddl_add');
+      try {
+        final schema = _createTestSchema();
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+
+        // addColumn only supports numeric types (int32/int64/uint32/uint64/float/double)
+        final newField = FieldSchema(
+          name: 'priority',
+          dataType: DataType.int64,
+        );
+        collection.addColumn(newField);
+        newField.destroy();
+
+        final s = collection.schema;
+        expect(s.hasField('priority'), isTrue);
+        s.destroy();
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('dropColumn removes a field', () {
+      final dir = _createTempDir('ddl_drop');
+      try {
+        final schema = _createTestSchema();
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+
+        // dropColumn only supports numeric types; drop 'count' (int64)
+        collection.dropColumn('count');
+        final s = collection.schema;
+        expect(s.hasField('count'), isFalse);
+        s.destroy();
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('createIndex and dropIndex', () {
+      final dir = _createTempDir('ddl_index');
+      try {
+        // Create collection with a string field that has no index
+        final schema = CollectionSchema(name: 'idx_test', fields: [
+          VectorSchema('embedding', 4, indexParams: HnswIndexParams()),
+          FieldSchema(name: 'title', dataType: DataType.string),
+        ]);
+        final collection = Collection.createAndOpen(_dbPath(dir), schema);
+        schema.destroy();
+
+        // Add an invert index on 'title'
+        final params = InvertIndexParams();
+        collection.createIndex('title', params);
+        params.destroy();
+
+        // Verify index exists
+        final s = collection.schema;
+        final f = s.getField('title');
+        expect(f!.hasIndex, isTrue);
+        s.destroy();
+
+        // Drop the index
+        collection.dropIndex('title');
+        final s2 = collection.schema;
+        final f2 = s2.getField('title');
+        expect(f2!.hasIndex, isFalse);
+        s2.destroy();
+
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+  });
+
+  // =========================================================================
+  // Task 11: CollectionStats and error handling
+  // =========================================================================
+  group('CollectionStats', () {
+
+    test('docCount reflects inserted documents', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        final stats = collection.stats;
+        expect(stats.docCount, 10);
+        stats.destroy();
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('indexCount after optimize', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        final stats = collection.stats;
+        expect(stats.indexCount, greaterThan(0));
+
+        // Verify getIndexName and getIndexCompleteness
+        for (var i = 0; i < stats.indexCount; i++) {
+          expect(stats.getIndexName(i), isNotEmpty);
+          expect(
+            stats.getIndexCompleteness(i),
+            greaterThanOrEqualTo(0.0),
+          );
+        }
+        stats.destroy();
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+
+    test('indexes computed map', () {
+      final (collection, dir) = _createPopulatedCollection();
+      try {
+        final stats = collection.stats;
+        final indexes = stats.indexes;
+        expect(indexes, isNotEmpty);
+        for (final entry in indexes.entries) {
+          expect(entry.key, isNotEmpty);
+          expect(entry.value, greaterThanOrEqualTo(0.0));
+        }
+        stats.destroy();
+        collection.close();
+      } finally {
+        _cleanupDir(dir);
+      }
+    });
+  });
+
+  group('Error handling', () {
+
+    test('open non-existent collection throws ZvecException', () {
+      expect(
+        () => Collection.open('/tmp/zvec_test_does_not_exist_12345'),
+        throwsA(isA<ZvecException>()),
+      );
+    });
+
+    test('ZvecException contains error code', () {
+      try {
+        Collection.open('/tmp/zvec_test_does_not_exist_12345');
+        fail('Expected ZvecException');
+      } on ZvecException catch (e) {
+        // Should be a meaningful error code (not ok)
+        expect(e.code, isNot(ZvecErrorCode.ok));
+        expect(e.toString(), contains('ZvecException'));
+      }
+    });
+  });
+}
