@@ -47,3 +47,7 @@ app.*.map.json
 # CocoaPods
 ios/Pods/
 ios/Podfile.lock
+
+# Flutter-generated metadata & boilerplate
+.metadata
+test/
